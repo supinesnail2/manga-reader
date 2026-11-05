@@ -1,0 +1,10 @@
+*.exe
+*.old
+bin/
+obj/
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini
+*.log
+library/
