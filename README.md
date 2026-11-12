@@ -2,6 +2,8 @@
 
 Paste a link, download the pages, read them offline.
 
+**Download:** get `Manga Reader.exe` from the [Releases page](../../releases/latest). No install, no Python.
+
 **Start:** double-click `Manga Reader.exe` or the Manga Reader shortcut on your desktop. It opens in its own window, and closing the window stops the app. Python isn't needed to run it.
 
 ## Where your manga is saved
@@ -16,7 +18,14 @@ If you move `Manga Reader.exe`, the desktop shortcut needs recreating. The windo
 
 1. **Paste a link** to a series or a chapter. A series link lets you pick which chapters to download.
 2. **Send pages from your browser**, for sites that turn the app away or build pages with scripts. With the app open, add the bookmark from the app to your normal browser's bookmarks bar, open the chapter, scroll to the end, click the bookmark. The confirmation opens in that browser, and the chapter lands in your library.
-3. **Import files**: CBZ, ZIP or images, by button or drag and drop.
+3. **Browse sources**: search GetComics, Comics-All, ComicsCodes (manga and comics lists) and JNovels from inside the app, or jump to Comic Book Plus. Open a result to see its downloads:
+   - **Download** puts the file straight into your library (GetComics, PixelDrain and MediaFire links, and direct CBZ/CBR links).
+   - **Read pages** loads an online reader page the same way as a pasted link.
+   - **Open in browser** is for hosts that need a real browser (MEGA, ad link pages, captchas). Download the file there, then drop it on the library page.
+4. **Add a folder** of your own collection. Every CBZ, ZIP, CBR and RAR in it and its subfolders is copied into your library: each subfolder becomes a series, each file a chapter or volume, and folders of loose images count too. Folders you add are remembered, so **Check for new files** picks up anything you've added since, skipping what's already in.
+5. **Import files**: CBZ, CBR, ZIP, RAR or images, by button or drag and drop.
+
+CBR and RAR files are opened with the `tar` that comes with Windows 10 and 11. A few newer RAR files need [7-Zip](https://www.7-zip.org/), which the app uses automatically when it's installed. PDFs aren't supported.
 
 ## Reading
 
@@ -39,4 +48,6 @@ If you move `Manga Reader.exe`, the desktop shortcut needs recreating. The windo
 
 ## Changing the app
 
-Edit `manga_reader.py` or `static/index.html`, then run `build_tools\build.bat` to rebuild the .exe (needs Python).
+Edit `manga_reader.py`, `sources.py` (one parser per site, so a site changing its layout means changing one class) or `static/index.html`, then run `build_tools\build.bat` to rebuild the .exe (needs Python).
+
+GitHub builds the .exe too: every push and pull request gets one under **Actions** > the run > **Artifacts**, and pushing a tag like `v1.1.0` publishes it on the Releases page.

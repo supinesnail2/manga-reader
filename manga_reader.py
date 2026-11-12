@@ -32,6 +32,8 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import sources
+
 FROZEN = getattr(sys, "frozen", False)
 # As an .exe, the library stays beside the .exe while bundled files unpack to a temp folder.
 ROOT = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent
@@ -57,6 +59,12 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 MAX_PAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_BYTES = 100 * 1024 * 1024
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
+FILE_CHUNK_BYTES = 1024 * 1024
+LIST_CACHE_SECONDS = 30 * 60
+ARCHIVE_EXTENSIONS = (".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
+MIN_LOOSE_IMAGES = 3  # a folder with at least this many images counts as a chapter
 DOWNLOAD_WORKERS = 6
 CHAPTER_DELAY_SECONDS = 0.5
 
@@ -580,6 +588,13 @@ def load_library_setting():
         LIBRARY.mkdir(exist_ok=True)
 
 
+def save_setting(key, value):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    current = read_json(SETTINGS_FILE, {}) or {}
+    current[key] = value
+    write_json(SETTINGS_FILE, current)
+
+
 def manga_folders():
     return [f for f in LIBRARY.iterdir() if f.is_dir() and (f / "manga.json").exists()]
 
@@ -617,25 +632,24 @@ def change_library(raw_path, move):
                 moved += 1
             except OSError:
                 skipped.append(folder.name)
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    write_json(SETTINGS_FILE, {"libraryPath": str(new)})
+    save_setting("libraryPath", str(new))
     LIBRARY, LIBRARY_WARNING = new, ""
     return {"path": str(new), "moved": moved, "skipped": skipped}
 
 
-def browse_for_folder():
+def browse_for_folder(description="Choose where Manga Reader saves your manga", start=None):
     """Show Windows' own folder picker. Returns the chosen path, or None if cancelled."""
     script = (
         "Add-Type -AssemblyName System.Windows.Forms;"
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
         "$owner=New-Object Windows.Forms.Form;$owner.TopMost=$true;"
         "$dialog=New-Object Windows.Forms.FolderBrowserDialog;"
-        "$dialog.Description='Choose where Manga Reader saves your manga';"
+        "$dialog.Description=$env:MANGA_READER_TITLE;"
         "$dialog.SelectedPath=$env:MANGA_READER_START;"
         "if($dialog.ShowDialog($owner) -eq 'OK'){$dialog.SelectedPath}")
     result = subprocess.run(
         ["powershell", "-NoProfile", "-STA", "-Command", script], capture_output=True, encoding="utf-8",
-        errors="replace", env={**os.environ, "MANGA_READER_START": str(LIBRARY)},
+        errors="replace", env={**os.environ, "MANGA_READER_START": str(start or LIBRARY), "MANGA_READER_TITLE": description},
         creationflags=subprocess.CREATE_NO_WINDOW)
     return result.stdout.strip().lstrip("\ufeff") or None
 
@@ -726,8 +740,86 @@ def download_one(url, referer, destination):
     return {"f": path.name, "w": w, "h": h}
 
 
+class NotAFile(FetchError):
+    """The link led to a web page, so the person needs to download it in their own browser."""
+
+
+def open_download(url, referer):
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        return urllib.request.urlopen(urllib.request.Request(normalize_url(url), headers=headers), timeout=60)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403, 429, 503):
+            raise Blocked(f"The file host refused the download (HTTP {error.code}).") from error
+        raise FetchError(f"The file host answered HTTP {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise FetchError(f"Couldn't reach the file host: {error.reason}") from error
+    except (TimeoutError, OSError) as error:
+        raise FetchError(f"Connection problem: {error}") from error
+
+
+def download_file(job, url, referer, destination):
+    """Stream a comic file to disk, following the hops file hosts put in front of it."""
+    for _ in range(4):
+        if "mediafire.com/file/" in url:
+            page, final, _ = fetch(url, referer=referer)
+            direct = sources.mediafire_direct(page.decode("utf-8", "replace"))
+            if not direct:
+                raise NotAFile("MediaFire didn't offer a direct download for this file.")
+            referer, url = final, direct
+        url = sources.pixeldrain_direct(url) or url
+        response = open_download(url, referer)
+        with response:
+            final = response.geturl()
+            if final != url and ("mediafire.com/file/" in final or "pixeldrain.com/u/" in final):
+                referer, url = url, final
+                continue
+            head = response.read(FILE_CHUNK_BYTES)
+            if not archive_kind(head):
+                kind = (response.headers.get("Content-Type") or "").lower()
+                raise NotAFile("That link opens a web page, not a file." if "html" in kind or head.lstrip()[:1] == b"<"
+                               else "That link didn't give a comic file the app can read.")
+            total = int(response.headers.get("Content-Length") or 0)
+            update_job(job, bytesDone=len(head), bytesTotal=total)
+            with open(destination, "wb") as out:
+                out.write(head)
+                done = len(head)
+                while chunk := response.read(FILE_CHUNK_BYTES):
+                    done += len(chunk)
+                    if done > MAX_FILE_BYTES:
+                        raise FetchError("That file is too large.")
+                    out.write(chunk)
+                    update_job(job, bytesDone=done)
+            return
+    raise NotAFile("The file host kept redirecting.")
+
+
+def download_file_chapter(job, manga_folder, item, label):
+    update_job(job, current=label, pagesDone=0, pagesTotal=0, bytesDone=0, bytesTotal=0)
+    work = Path(tempfile.mkdtemp(prefix=".staging-", dir=manga_folder))
+    try:
+        packed = work / "download"
+        try:
+            download_file(job, item["file"], item.get("referer"), packed)
+        except NotAFile:
+            with jobs_lock:
+                job["external"].append(item["file"])
+            raise
+        try:
+            count = import_file_into(manga_folder, packed, label, item.get("number"), item.get("referer") or item["file"])
+        except ValueError as error:
+            raise FetchError(str(error)) from error
+        update_job(job, pagesDone=count, pagesTotal=count)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def download_chapter(job, manga_folder, item):
     label = item.get("label") or chapter_label(item.get("number"))
+    if item.get("file"):
+        return download_file_chapter(job, manga_folder, item, label)
     referer = item.get("referer") or item.get("url")
     images = item.get("images")
     number = item.get("number")
@@ -774,6 +866,10 @@ def job_worker():
     while True:
         job, body = job_queue.get()
         update_job(job, status="running")
+        if body.get("folderPath"):
+            run_folder_job(job, body["folderPath"])
+            job_queue.task_done()
+            continue
         folder = ensure_manga(body["title"], body.get("source", ""))
         save_cover(folder, body.get("cover"), body.get("source"), bool(body.get("replaceCover")))
         items = body["items"]
@@ -803,7 +899,8 @@ def start_job(body):
         raise ValueError("A title and at least one chapter are required.")
     job = {"id": uuid.uuid4().hex[:10], "title": title, "status": "queued", "current": "",
            "chaptersDone": 0, "chaptersTotal": len(items), "pagesDone": 0, "pagesTotal": 0,
-           "warnings": [], "blocked": False, "mangaId": slug(title), "created": time.time()}
+           "warnings": [], "blocked": False, "external": [], "bytesDone": 0, "bytesTotal": 0,
+           "mangaId": slug(title), "created": time.time()}
     with jobs_lock:
         jobs[job["id"]] = job
     job_queue.put((job, {"title": title, "items": items, "source": body.get("source", ""),
@@ -811,31 +908,294 @@ def start_job(body):
     return job
 
 
+# ---------------------------------------------------------------- your own collection
+
+def scan_collection(root):
+    """Find comics in a folder and everything under it. Each file is a chapter; the folder it
+    sits in is the series. Files right in the chosen folder take their series from their name."""
+    root = Path(root)
+    found = []
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted((d for d in dirs if not d.startswith(".")), key=natural_key)
+        here = Path(folder)
+        archives = sorted((f for f in files if f.lower().endswith(ARCHIVE_EXTENSIONS)), key=natural_key)
+        images = [f for f in files if f.lower().endswith(IMAGE_EXTENSIONS)]
+        for name in archives:
+            stem = Path(name).stem
+            if here != root:
+                series, label = here.name, chapter_name(stem, here.name)
+            else:
+                series, label = split_file_name(stem)
+            found.append({"path": str(here / name), "series": series, "label": label})
+        if not archives and len(images) >= MIN_LOOSE_IMAGES and here != root:
+            # A folder of images is a chapter of the folder above it.
+            parent = here.parent
+            series = parent.name if parent != root else here.name
+            found.append({"path": str(here), "series": series, "label": chapter_name(here.name, series),
+                          "images": True})
+    return found
+
+
+def split_file_name(stem):
+    """'Batman_001_(2026)_(digital)' -> ('Batman', '#1'); 'Berserk v03' -> ('Berserk', 'v03')."""
+    name = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", stem.replace("_", " "))
+    name = " ".join(name.split())
+    match = re.match(r"(.+?)\s+#?0*(\d+(?:\.\d+)?)$", name)
+    if match and not re.search(r"(?:vol(?:ume)?|v|ch(?:apter)?)\.?$", match.group(1), re.I):
+        return match.group(1).strip(" -–—:"), f"#{match.group(2)}"
+    series = sources.series_name(name) or name or stem
+    return series, chapter_name(name, series) if name != series else "Chapter 1"
+
+
+def chapter_name(stem, series):
+    name = stem.replace("_", " ").strip()
+    if series and name.lower().startswith(series.lower()) and len(name) > len(series) + 1:
+        name = name[len(series):].strip(" -–—:._")
+    return name or stem
+
+
+def already_imported(folder, label, path):
+    meta = read_json(folder / slug(label) / "chapter.json", {}) or {}
+    return meta.get("source") == path
+
+
+def run_folder_job(job, root):
+    try:
+        found = scan_collection(root)
+    except OSError as error:
+        update_job(job, status="error", current="", warnings=[f"Couldn't read {root}: {error}"])
+        return
+    update_job(job, chaptersTotal=max(len(found), 1))
+    saved = skipped = 0
+    last = ""
+    for position, entry in enumerate(found):
+        update_job(job, current=f"{entry['series']} · {entry['label']}", pagesDone=0, pagesTotal=0)
+        folder = ensure_manga(entry["series"], root)
+        try:
+            if already_imported(folder, entry["label"], entry["path"]):
+                skipped += 1
+            elif entry.get("images"):
+                files = sorted((p for p in Path(entry["path"]).iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS),
+                               key=lambda p: natural_key(p.name))
+                import_pages(folder, entry["label"], label_number(entry["label"]), entry["path"],
+                             [(p.name, p.read_bytes) for p in files])
+                saved += 1
+            else:
+                import_file_into(folder, entry["path"], entry["label"], source=entry["path"])
+                saved += 1
+            last = folder.name
+        except (ValueError, OSError, zipfile.BadZipFile) as error:
+            with jobs_lock:
+                job["warnings"].append(f"{Path(entry['path']).name}: {error}")
+        update_job(job, chaptersDone=position + 1)
+    note = f"{skipped} already in your library" if skipped else ""
+    if not found:
+        job["warnings"].append("No CBZ, ZIP, CBR or RAR files or image folders were found there.")
+    with jobs_lock:
+        if note:
+            job["warnings"].insert(0, note)
+    update_job(job, status="done" if saved or skipped else "error", current="", mangaId=last,
+               chaptersDone=len(found), saved=saved)
+
+
+def start_folder_job(raw_path):
+    path = Path((raw_path or "").strip().strip('"')).expanduser()
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("Pick a folder that exists, like D:\\Comics.")
+    path = path.resolve()
+    if path == LIBRARY.resolve() or LIBRARY.resolve() in path.parents:
+        raise ValueError("That's the app's own library folder. Pick the folder where your collection is.")
+    folders = (read_json(SETTINGS_FILE, {}) or {}).get("collectionFolders", [])
+    if str(path) not in folders:
+        save_setting("collectionFolders", folders + [str(path)])
+    job = {"id": uuid.uuid4().hex[:10], "title": f"Your files in {path.name or path}", "status": "queued",
+           "current": "", "chaptersDone": 0, "chaptersTotal": 1, "pagesDone": 0, "pagesTotal": 0,
+           "warnings": [], "blocked": False, "external": [], "bytesDone": 0, "bytesTotal": 0,
+           "mangaId": "", "folderJob": True, "created": time.time()}
+    with jobs_lock:
+        jobs[job["id"]] = job
+    job_queue.put((job, {"folderPath": str(path)}))
+    return job
+
+
+def forget_collection_folder(raw_path):
+    folders = (read_json(SETTINGS_FILE, {}) or {}).get("collectionFolders", [])
+    save_setting("collectionFolders", [f for f in folders if f != raw_path])
+
+
+# ---------------------------------------------------------------- sources
+
+list_cache = {}
+list_cache_lock = threading.Lock()
+
+
+def source_by_id(source_id):
+    source = sources.SOURCES.get(source_id or "")
+    if not source:
+        raise ValueError("Unknown source.")
+    return source
+
+
+def list_items(source):
+    with list_cache_lock:
+        cached = list_cache.get(source.id)
+        if cached and time.time() - cached[0] < LIST_CACHE_SECONDS:
+            return cached[1]
+    text, final_url = fetch_html(source.home)
+    items = source.parse_list(text, final_url)
+    with list_cache_lock:
+        list_cache[source.id] = (time.time(), items)
+    return items
+
+
+def search_source(body):
+    source = source_by_id(body.get("source"))
+    query = " ".join(str(body.get("query") or "").split())[:200]
+    page = max(1, int(body.get("page") or 1))
+    if source.kind == "external":
+        return {"external": source.search_url(query, page), "results": [], "hasNext": False}
+    if source.kind == "list":
+        results, has_next, total = sources.filter_list(list_items(source), query, page)
+        return {"results": results, "hasNext": has_next, "total": total}
+    text, final_url = fetch_html(source.search_url(query, page))
+    results, has_next = source.parse_results(text, final_url, page)
+    return {"results": results, "hasNext": has_next and bool(results)}
+
+
+def source_detail(body):
+    source = source_by_id(body.get("source"))
+    url = body.get("url") or ""
+    if not url.startswith("http"):
+        raise ValueError("That result has no link.")
+    text, final_url = fetch_html(url)
+    detail = sources.finish_detail(source.parse_detail(text, final_url), str(body.get("title") or ""))
+    detail["url"] = final_url
+    return detail
+
+
+def open_external(url):
+    if not re.match(r"https?://", url or ""):
+        raise ValueError("Only web links can be opened.")
+    webbrowser.open(url)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- local imports
 
-def import_archive(path, title, label):
+def label_number(label):
+    number = chapter_number(label)
+    return number if number is not None else sources.number_in(label)
+
+
+def archive_kind(head):
+    if head[:2] == b"PK":
+        return "zip"
+    if head[:6] == b"Rar!\x1a\x07":
+        return "rar"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    if head[:4] == b"%PDF":
+        return "pdf"
+    return None
+
+
+def archive_tools():
+    """Programs that can unpack CBR, RAR and 7z. Windows 10 and 11 come with tar, which reads
+    most RAR files; 7-Zip, if it's installed, reads all of them."""
+    tools = []
+    for root in filter(None, (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"))):
+        seven = Path(root) / "7-Zip" / "7z.exe"
+        if seven.exists():
+            tools.append(("7z", str(seven)))
+    if shutil.which("7z"):
+        tools.append(("7z", shutil.which("7z")))
+    system_tar = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "tar.exe"
+    if system_tar.exists():
+        tools.append(("tar", str(system_tar)))
+    elif shutil.which("bsdtar"):
+        tools.append(("tar", shutil.which("bsdtar")))
+    return tools
+
+
+def extract_with_tool(path, destination):
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for kind, program in archive_tools():
+        command = ([program, "x", "-y", f"-o{destination}", str(path)] if kind == "7z"
+                   else [program, "-xf", str(path), "-C", str(destination)])
+        try:
+            result = subprocess.run(command, capture_output=True, creationflags=flags, timeout=600)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and any(p.is_file() for p in Path(destination).rglob("*")):
+            return
+    raise ValueError("This CBR/RAR file couldn't be opened. Installing 7-Zip (free, 7-zip.org) "
+                     "lets the app open every kind.")
+
+
+def import_pages(folder, label, number, source, entries):
+    """Save a chapter from (name, read) pairs, in natural name order. read() returns the bytes."""
     pages = []
-    folder = ensure_manga(title, "imported file")
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=folder))
     try:
-        with zipfile.ZipFile(path) as archive:
-            names = [i for i in archive.infolist()
-                     if not i.is_dir() and "__MACOSX" not in i.filename and i.file_size <= MAX_IMAGE_BYTES]
-            for info in sorted(names, key=lambda i: natural_key(i.filename)):
-                with archive.open(info) as source:
-                    data = source.read(MAX_IMAGE_BYTES + 1)
-                extension = sniff_extension(data)
-                if not extension or len(data) > MAX_IMAGE_BYTES:
-                    continue
-                name = f"{len(pages) + 1:04d}{extension}"
-                (staging / name).write_bytes(data)
-                w, h = image_size(data)
-                pages.append({"f": name, "w": w, "h": h})
+        for name, read in sorted(entries, key=lambda e: natural_key(e[0])):
+            data = read()
+            extension = sniff_extension(data)
+            if not extension or len(data) > MAX_IMAGE_BYTES:
+                continue
+            page_name = f"{len(pages) + 1:04d}{extension}"
+            (staging / page_name).write_bytes(data)
+            w, h = image_size(data)
+            pages.append({"f": page_name, "w": w, "h": h})
         if not pages:
-            raise ValueError("No images were found in that archive.")
-        save_chapter(folder, label, chapter_number(label), "imported file", staging, join_slices(pages))
+            raise ValueError("No images were found in that file.")
+        save_chapter(folder, label, number, source, staging, join_slices(pages))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    return len(pages)
+
+
+def import_file_into(folder, path, label, number=None, source="imported file"):
+    """Import one CBZ, ZIP, CBR, RAR or 7z file (given as a path or a file object) as a chapter."""
+    if number is None:
+        number = label_number(label)
+    if hasattr(path, "read"):
+        head = path.read(8)
+        path.seek(0)
+    else:
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+    kind = archive_kind(head)
+    if kind == "zip":
+        with zipfile.ZipFile(path) as archive:
+            infos = [i for i in archive.infolist()
+                     if not i.is_dir() and "__MACOSX" not in i.filename and i.file_size <= MAX_IMAGE_BYTES]
+            return import_pages(folder, label, number, source,
+                                [(i.filename, lambda i=i: archive.read(i)) for i in infos])
+    if kind in ("rar", "7z"):
+        work = Path(tempfile.mkdtemp(prefix=".unpack-", dir=folder))
+        try:
+            if hasattr(path, "read"):
+                packed = work / "packed"
+                with open(packed, "wb") as out:
+                    shutil.copyfileobj(path, out)
+                path = packed
+            unpacked = work / "files"
+            unpacked.mkdir()
+            extract_with_tool(path, unpacked)
+            files = [p for p in unpacked.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                     and "__MACOSX" not in p.parts]
+            return import_pages(folder, label, number, source,
+                                [(str(p.relative_to(unpacked)), p.read_bytes) for p in files])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    if kind == "pdf":
+        raise ValueError("PDFs can't be read by the app. Save them as CBZ, or open them in your browser.")
+    raise ValueError("That isn't a CBZ, ZIP, CBR or RAR file.")
+
+
+def import_archive(path, title, label):
+    folder = ensure_manga(title, "imported file")
+    import_file_into(folder, path, label)
     return folder.name
 
 
@@ -922,7 +1282,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(sorted(jobs.values(), key=lambda j: -j["created"]))
             if parts == ["api", "settings"]:
                 return self.send_json({"libraryPath": str(LIBRARY), "defaultPath": str(DEFAULT_LIBRARY),
-                                       "warning": LIBRARY_WARNING, "mangaCount": len(manga_folders())})
+                                       "warning": LIBRARY_WARNING, "mangaCount": len(manga_folders()),
+                                       "collectionFolders": (read_json(SETTINGS_FILE, {}) or {}).get("collectionFolders", []),
+                                       "archiveTool": bool(archive_tools())})
+            if parts == ["api", "sources"]:
+                return self.send_json([s.describe() for s in sources.SOURCES.values()])
             if len(parts) == 3 and parts[:2] == ["api", "manga"]:
                 folder = manga_folder(parts[2])
                 meta = read_json(folder / "manga.json", {}) or {}
@@ -970,7 +1334,22 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json_body()
                 return self.send_json(change_library(body.get("path"), bool(body.get("move"))))
             if url.path == "/api/settings/browse":
+                body = self.read_json_body()
+                if body.get("purpose") == "collection":
+                    return self.send_json({"path": browse_for_folder("Choose the folder with your comics and manga",
+                                                                     Path.home())})
                 return self.send_json({"path": browse_for_folder()})
+            if url.path == "/api/import-folder":
+                return self.send_json(start_folder_job(self.read_json_body().get("path")))
+            if url.path == "/api/import-folder/forget":
+                forget_collection_folder(self.read_json_body().get("path"))
+                return self.send_json({"ok": True})
+            if url.path == "/api/sources/search":
+                return self.send_json(search_source(self.read_json_body()))
+            if url.path == "/api/sources/detail":
+                return self.send_json(source_detail(self.read_json_body()))
+            if url.path == "/api/open-external":
+                return self.send_json(open_external(self.read_json_body().get("url")))
             if url.path == "/api/settings/open":
                 os.startfile(LIBRARY)
                 return self.send_json({"ok": True})
@@ -978,7 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": str(error), "blocked": True}, 502)
         except FetchError as error:
             return self.send_json({"error": str(error)}, 502)
-        except (ValueError, zipfile.BadZipFile) as error:
+        except (ValueError, TypeError, zipfile.BadZipFile) as error:
             return self.send_json({"error": str(error)}, 400)
         self.send_json({"error": "not found"}, 404)
 
@@ -988,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
         if not title:
             raise ValueError("A title is required.")
         data = self.read_body()
-        if data[:2] == b"PK":
+        if archive_kind(data[:8]):
             manga_id = import_archive(io.BytesIO(data), title, label)
         else:
             manga_id = import_image(data, title, label, params.get("reset") == "1")
@@ -1060,7 +1439,7 @@ def wait_for_window_to_close(window):
 
 
 def remove_interrupted_downloads():
-    for leftover in LIBRARY.glob("*/.staging-*"):
+    for leftover in [*LIBRARY.glob("*/.staging-*"), *LIBRARY.glob("*/.unpack-*")]:
         shutil.rmtree(leftover, ignore_errors=True)
 
 

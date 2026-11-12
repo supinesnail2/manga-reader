@@ -1,0 +1,47 @@
+# Builds "Manga Reader.exe" on Windows.
+# Every push and pull request gets the .exe as a downloadable build artifact (Actions tab > the run > Artifacts).
+# Pushing a tag like v1.2.0 also publishes it on the repo's Releases page.
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the source compiles
+        run: python -m py_compile manga_reader.py sources.py
+
+      - name: Build the .exe
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pyinstaller
+          pyinstaller --noconfirm --onefile --windowed --name "Manga Reader" `
+            --icon "$PWD\static\icon.ico" --add-data "$PWD\static;static" `
+            --distpath dist manga_reader.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Manga-Reader-windows
+          path: dist/Manga Reader.exe
+
+      - name: Publish a release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Manga Reader.exe
+          generate_release_notes: true

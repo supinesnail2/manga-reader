@@ -39,7 +39,7 @@ input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible
 a { color: var(--paper); }
 
 /* ---------- library ---------- */
-#library, #detail { max-width: 1120px; margin: 0 auto; padding: 32px 20px 64px; }
+#library, #detail, #browse { max-width: 1120px; margin: 0 auto; padding: 32px 20px 64px; }
 .save-path { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 13px; }
 .save-path button { padding: 3px 10px; font-size: 13px; }
 .save-path span { flex: none; }
@@ -111,6 +111,26 @@ h2 { font: 600 16px var(--display); margin: 0 0 12px; }
 .book-progress { height: 3px; background: var(--panel-2); border-radius: 2px; margin-top: 5px; overflow: hidden; }
 .book-progress i { display: block; height: 100%; background: var(--red); }
 .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; padding: 44px 20px; text-align: center; }
+.quick-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.quick-actions button { display: flex; align-items: center; gap: 8px; padding: 9px 14px; }
+.quick-actions small { color: var(--muted); font-size: 12px; }
+
+/* browse */
+.browse-head { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px; flex-wrap: wrap; }
+.source-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.source-tabs button.on { background: var(--paper); color: var(--ink); border-color: var(--paper); }
+.source-note { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+.result-cover-blank { aspect-ratio: 2 / 3; width: 100%; border-radius: var(--radius); background: var(--panel-2); border: 1px solid var(--line); display: grid; place-items: center; padding: 12px; text-align: center; color: var(--muted); font: 600 15px var(--display); overflow: hidden; }
+.pager { display: flex; justify-content: center; gap: 8px; margin-top: 22px; }
+.link-rows { list-style: none; margin: 10px 0; padding: 0; max-height: 46vh; overflow: auto; }
+.link-rows li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.link-rows .what { flex: 1; min-width: 0; }
+.link-rows .what div { overflow-wrap: anywhere; }
+.link-rows .host { color: var(--muted); font-size: 12px; }
+.link-section { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-top: 12px; }
+.folder-rows { list-style: none; margin: 8px 0; padding: 0; }
+.folder-rows li { display: flex; gap: 8px; align-items: center; padding: 5px 0; border-top: 1px solid var(--line); }
+.folder-rows code { flex: 1; }
 body.dropping #library { outline: 2px dashed var(--red); outline-offset: -8px; border-radius: 12px; }
 
 /* dialog */
@@ -193,8 +213,12 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
     <input id="urlInput" type="url" required placeholder="Paste a link to a manga or chapter" aria-label="Manga or chapter link" autocomplete="off">
     <button class="primary" id="fetchBtn">Fetch</button>
   </form>
-  <p class="hint">Site not cooperating? <button id="helpSend" type="button">Send pages from your browser</button> or <button id="importBtn" type="button">import files</button> (CBZ, ZIP, images). You can also drop them on this page.</p>
-  <input id="importInput" type="file" multiple accept=".cbz,.zip,image/*" hidden>
+  <p class="hint">Site not cooperating? <button id="helpSend" type="button">Send pages from your browser</button> or <button id="importBtn" type="button">import files</button> (CBZ, CBR, ZIP, RAR, images). You can also drop them on this page.</p>
+  <input id="importInput" type="file" multiple accept=".cbz,.cbr,.zip,.rar,.cb7,.7z,image/*" hidden>
+  <div class="quick-actions">
+    <button id="browseBtn" type="button">🔍 Browse sources <small>GetComics, ComicsCodes, JNovels…</small></button>
+    <button id="addFolderBtn" type="button">📁 Add a folder <small>your own CBZ / CBR collection</small></button>
+  </div>
 
   <section id="analysis" class="card-box" hidden></section>
   <section id="jobs" class="card-box" hidden></section>
@@ -214,6 +238,20 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 </main>
 
 <main id="detail" hidden></main>
+
+<main id="browse" hidden>
+  <button id="browseBack">← Library</button>
+  <div class="browse-head"><h1>Browse sources</h1></div>
+  <div class="source-tabs" id="sourceTabs" role="tablist" aria-label="Source"></div>
+  <p class="source-note" id="sourceNote"></p>
+  <form class="addbar" id="searchForm">
+    <input id="searchInput" type="search" placeholder="Search titles" aria-label="Search" autocomplete="off">
+    <button class="primary" id="searchBtn">Search</button>
+  </form>
+  <p class="hint" id="searchStatus"></p>
+  <div class="shelf" id="results" style="margin-top:16px"></div>
+  <div class="pager" id="pager"></div>
+</main>
 
 <div id="reader" hidden>
   <div class="bar-top">
@@ -539,6 +577,7 @@ async function submitDownload(title, source, items, coverInfo) {
     await api('/api/download', { json: { title, source, items, ...coverInfo } });
     $('analysis').hidden = true;
     $('urlInput').value = '';
+    if (!$('browse').hidden) toast('Downloading. Progress shows on the library page');
     pollJobs();
   } catch (error) { toast(error.message); }
 }
@@ -579,13 +618,17 @@ function renderJobs(jobs) {
   box.hidden = visible.length === 0;
   box.replaceChildren(...visible.map(job => {
     const active = job.status === 'queued' || job.status === 'running';
-    const chapterShare = job.pagesTotal ? job.pagesDone / job.pagesTotal : 0;
+    const chapterShare = job.bytesTotal ? job.bytesDone / job.bytesTotal : job.pagesTotal ? job.pagesDone / job.pagesTotal : 0;
+    const mb = n => (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB';
+    const fileProgress = job.bytesDone && !job.pagesTotal ? `downloading ${mb(job.bytesDone)}${job.bytesTotal ? ' of ' + mb(job.bytesTotal) : ''}` : '';
     const pct = active ? (job.chaptersDone + chapterShare) / job.chaptersTotal * 100 : 100;
     const state = job.status === 'queued' ? 'Waiting…'
-      : active ? `${job.current} · page ${job.pagesDone} of ${job.pagesTotal || '?'}`
-      : job.status === 'error' ? 'Download failed' : `Done, ${job.chaptersTotal} chapter${job.chaptersTotal === 1 ? '' : 's'}`;
+      : active && job.folderJob ? `${job.current || 'Looking for files…'} · ${job.chaptersDone} of ${job.chaptersTotal}`
+      : active ? `${job.current} · ${fileProgress || `page ${job.pagesDone} of ${job.pagesTotal || '?'}`}`
+      : job.status === 'error' ? (job.folderJob ? 'Nothing was added' : 'Download failed')
+      : job.folderJob ? `Done, ${job.saved || 0} added` : `Done, ${job.chaptersTotal} chapter${job.chaptersTotal === 1 ? '' : 's'}`;
     const right = el('div', { style: 'display:flex;gap:6px' });
-    if (job.status === 'done') right.append(el('button', { textContent: 'Open', onclick: () => { location.hash = `#/manga/${enc(job.mangaId)}`; } }));
+    if (job.status === 'done' && job.mangaId && !job.folderJob) right.append(el('button', { textContent: 'Open', onclick: () => { location.hash = `#/manga/${enc(job.mangaId)}`; } }));
     if (!active) right.append(el('button', { className: 'quiet', textContent: 'Dismiss', onclick: () => {
       finishedJobs.add(job.id);
       store.set('dismissedJobs', [...finishedJobs].slice(-50));
@@ -597,6 +640,10 @@ function renderJobs(jobs) {
         right),
       el('div', { className: 'bar' }, el('i', { style: `width:${pct}%` })));
     if (job.warnings.length) node.append(el('div', { className: 'hint error', textContent: job.warnings.slice(0, 4).join(' · ') + (job.warnings.length > 4 ? ` · and ${job.warnings.length - 4} more` : '') }));
+    if (job.external && job.external.length && !active) node.append(el('p', { className: 'hint' },
+      'The file host wants a real browser for this one. ',
+      el('button', { textContent: 'Open it in your browser', onclick: () => openExternal(job.external[0]) }),
+      ', then drop the downloaded file here to import it.'));
     if (job.blocked) node.append(el('p', { className: 'hint' }, 'The site turned this download away. ', el('button', { textContent: 'Send pages from your browser', onclick: showSendHelp }), ' instead.'));
     return node;
   }));
@@ -639,10 +686,206 @@ async function receiveSend(encoded) {
   showAnalysis({ kind: 'chapter', url: String(data.u || ''), title: info.title, label: info.label, number: info.number, images: urls, chapters: [], cover: '' });
 }
 
+/* ---------- browsing sources ---------- */
+const B = { sources: [], source: store.get('browseSource', 'getcomics'), query: '', page: 1, results: null, busy: false };
+const openExternal = url => api('/api/open-external', { json: { url } }).then(() => toast('Opened in your browser')).catch(e => toast(e.message));
+
+async function showBrowse() {
+  $('library').hidden = true;
+  $('detail').hidden = true;
+  $('reader').hidden = true;
+  $('browse').hidden = false;
+  document.title = 'Browse sources · Manga Reader';
+  if (!B.sources.length) B.sources = await api('/api/sources');
+  if (!B.sources.some(s => s.id === B.source)) B.source = B.sources[0].id;
+  renderSourceTabs();
+  if (!B.results) runSearch(1);
+  $('searchInput').focus({ preventScroll: true });
+}
+
+function currentSource() { return B.sources.find(s => s.id === B.source); }
+
+function renderSourceTabs() {
+  $('sourceTabs').replaceChildren(...B.sources.map(s => el('button', {
+    className: s.id === B.source ? 'on' : '', textContent: s.name, role: 'tab', ariaSelected: String(s.id === B.source),
+    onclick: () => { B.source = s.id; store.set('browseSource', s.id); B.results = null; renderSourceTabs(); runSearch(1); },
+  })));
+  const source = currentSource();
+  $('sourceNote').replaceChildren(source.note + ' ', el('a', { href: '#', textContent: 'Open the site', onclick: e => { e.preventDefault(); openExternal(source.home); } }));
+  $('searchInput').placeholder = source.kind === 'list' ? `Filter ${source.name} by title` : `Search ${source.name}`;
+}
+
+$('browseBtn').onclick = () => { location.hash = '#/browse'; };
+$('browseBack').onclick = () => { location.hash = ''; };
+$('searchForm').addEventListener('submit', e => { e.preventDefault(); runSearch(1); });
+
+async function runSearch(page) {
+  const source = currentSource();
+  const query = $('searchInput').value.trim();
+  const status = $('searchStatus');
+  status.classList.remove('error');
+  if (source.kind === 'external') {
+    $('results').replaceChildren();
+    $('pager').replaceChildren();
+    status.replaceChildren(`${source.name} only works in a real browser. `,
+      el('button', { textContent: query ? `Search “${query}” in your browser` : 'Open it in your browser', onclick: async () => {
+        const answer = await api('/api/sources/search', { json: { source: source.id, query } });
+        openExternal(answer.external);
+      } }));
+    B.results = [];
+    return;
+  }
+  const ticket = {};
+  B.busy = ticket;
+  status.textContent = source.kind === 'list' && !B.results ? `Loading the ${source.name} list…` : 'Searching…';
+  $('searchBtn').disabled = true;
+  try {
+    const answer = await api('/api/sources/search', { json: { source: source.id, query, page } });
+    if (B.busy !== ticket) return;
+    B.query = query; B.page = page; B.results = answer.results;
+    renderResults(answer);
+    const count = answer.total !== undefined ? `${answer.total} title${answer.total === 1 ? '' : 's'}` : '';
+    status.textContent = answer.results.length ? (count ? `${count}${query ? ` match “${query}”` : ''}` : (query ? `Results for “${query}”` : 'Latest')) + (page > 1 ? ` · page ${page}` : '')
+      : query ? `Nothing on ${source.name} matches “${query}”.` : 'Nothing found.';
+  } catch (error) {
+    if (B.busy !== ticket) return;
+    $('results').replaceChildren();
+    $('pager').replaceChildren();
+    status.replaceChildren(el('span', { className: 'error', textContent: error.message + ' ' }),
+      error.blocked ? el('button', { textContent: 'Open the site in your browser', onclick: () => openExternal(source.home) }) : '');
+  } finally {
+    if (B.busy === ticket) { B.busy = false; $('searchBtn').disabled = false; }
+  }
+}
+
+function renderResults(answer) {
+  const shelf = $('results');
+  shelf.replaceChildren(...answer.results.map(result => {
+    const blank = () => el('div', { className: 'result-cover-blank', textContent: result.title });
+    const cover = result.cover
+      ? el('img', { className: 'book-cover', src: result.cover, alt: '', loading: 'lazy', referrerPolicy: 'no-referrer', onerror() { this.replaceWith(blank()); } })
+      : blank();
+    return el('div', { className: 'book' },
+      el('button', { className: 'book-open', title: result.title, onclick: () => showResult(result) },
+        cover, el('div', { className: 'book-title', textContent: result.title })),
+      el('div', { className: 'book-meta', textContent: result.info || '' }));
+  }));
+  const pager = $('pager');
+  pager.replaceChildren();
+  if (B.page > 1) pager.append(el('button', { textContent: '← Previous', onclick: () => { runSearch(B.page - 1); scrollTo(0, 0); } }));
+  if (answer.hasNext) pager.append(el('button', { textContent: 'Next page →', onclick: () => { runSearch(B.page + 1); scrollTo(0, 0); } }));
+}
+
+async function showResult(result) {
+  const d = $('dialog');
+  const source = currentSource();
+  d.replaceChildren(el('h2', { textContent: result.title }), el('p', { className: 'hint', textContent: 'Looking for downloads…' }));
+  d.showModal();
+  let detail;
+  try {
+    detail = await api('/api/sources/detail', { json: { source: source.id, url: result.url, title: result.title } });
+  } catch (error) {
+    d.replaceChildren(el('h2', { textContent: result.title }),
+      el('p', { className: 'error', textContent: error.message }),
+      el('div', { className: 'row', style: 'justify-content:flex-end;margin-top:12px' },
+        el('button', { textContent: 'Open the page in your browser', onclick: () => openExternal(result.url) }),
+        el('button', { textContent: 'Close', onclick: () => d.close() })));
+    return;
+  }
+  const titleInput = el('input', { type: 'text', value: detail.series || result.title });
+  titleInput.setAttribute('list', 'browseTitles');
+  const known = el('datalist', { id: 'browseTitles' }, ...libraryItems.map(m => el('option', { value: m.title })));
+  const cover = detail.cover || result.cover;
+  const head = el('div', { className: 'analysis-head' }, el('div', { className: 'row' }, el('label', { className: 'field' }, 'Save as', titleInput)));
+  if (cover) head.prepend(el('img', { className: 'analysis-cover', src: cover, alt: '', referrerPolicy: 'no-referrer', onerror() { this.remove(); } }));
+  const list = el('ul', { className: 'link-rows' });
+  let section = null;
+  for (const link of detail.links) {
+    if (link.section && link.section !== section) {
+      section = link.section;
+      list.append(el('li', { className: 'link-section', style: 'border:0' }, section));
+    }
+    const action = link.kind === 'file'
+      ? el('button', { className: 'primary', textContent: 'Download', onclick: e => {
+          e.target.disabled = true;
+          e.target.textContent = 'Queued';
+          submitDownload(titleInput.value, detail.url, [{ file: link.url, label: link.chapter, number: link.number, referer: detail.url }], { cover, replaceCover: false });
+        } })
+      : link.kind === 'page'
+        ? el('button', { textContent: 'Read pages', title: 'Load this reader page the same way as a pasted link', onclick: () => {
+            d.close();
+            location.hash = '';
+            $('urlInput').value = link.url;
+            $('addForm').requestSubmit();
+          } })
+        : el('button', { textContent: 'Open in browser', onclick: () => openExternal(link.url) });
+    list.append(el('li', {},
+      el('div', { className: 'what' }, el('div', { textContent: link.chapter && link.chapter !== link.label ? `${link.chapter} · ${link.label}` : link.label }),
+        el('div', { className: 'host', textContent: link.host + (link.kind === 'file' ? ' · straight into your library' : link.kind === 'page' ? ' · read online' : ' · download it there, then drop the file here') })),
+      action));
+  }
+  d.replaceChildren(el('h2', { textContent: detail.title || result.title }), head, known);
+  if (detail.links.length) {
+    d.append(list, el('p', { className: 'hint', textContent: 'Downloads land in your library. Links that open in your browser give you a file: drop it on the library page to add it.' }));
+  } else {
+    d.append(el('p', { textContent: 'No download links were found on this page.' }));
+  }
+  d.append(el('div', { className: 'row', style: 'justify-content:flex-end;margin-top:12px' },
+    el('button', { className: 'quiet', textContent: 'Open the page in your browser', onclick: () => openExternal(detail.url) }),
+    el('button', { textContent: 'Close', onclick: () => d.close() })));
+}
+
+/* ---------- adding a folder of your own files ---------- */
+$('addFolderBtn').onclick = () => {
+  const d = $('dialog');
+  const input = el('input', { type: 'text', className: 'path-input', placeholder: 'D:\\Comics', ariaLabel: 'Folder', spellcheck: false });
+  const status = el('p', { className: 'hint' });
+  const browse = el('button', { textContent: 'Browse…' });
+  browse.onclick = async () => {
+    browse.disabled = true;
+    try {
+      const picked = await api('/api/settings/browse', { json: { purpose: 'collection' } });
+      if (picked.path) input.value = picked.path;
+    } catch (error) { status.textContent = error.message; }
+    browse.disabled = false;
+  };
+  const scan = async path => {
+    status.classList.remove('error');
+    try {
+      await api('/api/import-folder', { json: { path } });
+      d.close();
+      pollJobs();
+      toast('Adding your files');
+    } catch (error) { status.textContent = error.message; status.classList.add('error'); }
+  };
+  const add = el('button', { className: 'primary', textContent: 'Add', onclick: () => scan(input.value) });
+  d.replaceChildren(
+    el('h2', { textContent: 'Add a folder of your own files' }),
+    el('p', { textContent: 'Every CBZ, ZIP, CBR and RAR in the folder and its subfolders is copied into your library. Each subfolder becomes a series; each file a chapter or volume. Folders of loose images count too.' }),
+    el('div', { className: 'row', style: 'flex-wrap:nowrap' }, input, browse));
+  if (!librarySettings.archiveTool) d.append(el('p', { className: 'hint', textContent: 'CBR and RAR files need tar (built into Windows 10 and 11) or 7-Zip.' }));
+  const folders = librarySettings.collectionFolders || [];
+  if (folders.length) {
+    d.append(el('div', { className: 'link-section', textContent: 'Folders you added before' }),
+      el('ul', { className: 'folder-rows' }, ...folders.map(path => el('li', {},
+        el('code', { textContent: path }),
+        el('button', { textContent: 'Check for new files', onclick: () => scan(path) }),
+        el('button', { className: 'quiet', textContent: 'Remove', title: 'Stop listing this folder. What was imported stays in your library.', onclick: async e => {
+          await api('/api/import-folder/forget', { json: { path } });
+          librarySettings.collectionFolders = folders.filter(f => f !== path);
+          e.target.closest('li').remove();
+        } })))));
+  }
+  d.append(status, el('div', { className: 'row', style: 'justify-content:flex-end;margin-top:12px' },
+    el('button', { textContent: 'Cancel', onclick: () => d.close() }), add));
+  d.showModal();
+  input.focus();
+};
+
 /* ---------- importing files ---------- */
 $('importBtn').onclick = () => $('importInput').click();
 $('importInput').onchange = e => { importFiles([...e.target.files]); e.target.value = ''; };
-addEventListener('dragover', e => { if ($('reader').hidden) { e.preventDefault(); document.body.classList.add('dropping'); } });
+addEventListener('dragover', e => { if ($('reader').hidden && e.dataTransfer.types.includes('Files')) { e.preventDefault(); document.body.classList.add('dropping'); } });
 addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('dropping'); });
 addEventListener('drop', e => {
   document.body.classList.remove('dropping');
@@ -655,8 +898,9 @@ const naturalCompare = (a, b) => a.localeCompare(b, undefined, { numeric: true, 
 function importFiles(files) {
   if (!files.length) return;
   const stem = name => name.replace(/\.[^.]+$/, '');
-  const archives = files.filter(f => /\.(cbz|zip)$/i.test(f.name));
-  const images = files.filter(f => !/\.(cbz|zip)$/i.test(f.name)).sort((a, b) => naturalCompare(a.name, b.name));
+  const isArchive = f => /\.(cbz|cbr|zip|rar|cb7|7z)$/i.test(f.name);
+  const archives = files.filter(isArchive).sort((a, b) => naturalCompare(a.name, b.name));
+  const images = files.filter(f => !isArchive(f)).sort((a, b) => naturalCompare(a.name, b.name));
   const titleInput = el('input', { type: 'text', value: archives.length ? stem(archives[0].name).replace(/[\s_-]*(chapter|ch|vol|volume|v)?[\s._-]*\d+.*$/i, '') || stem(archives[0].name) : '' });
   const labelInput = el('input', { type: 'text', value: 'Chapter 1' });
   const status = el('p', { className: 'hint' });
@@ -1144,6 +1388,15 @@ async function route() {
     await receiveSend(hash.slice(6));
     return;
   }
+  if (hash === '#/browse') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    if (longObserver) { longObserver.disconnect(); longObserver = null; }
+    R.manga = null;
+    try { await renderLibrary(); } catch {}
+    await showBrowse();
+    return;
+  }
+  $('browse').hidden = true;
   const page = hash.match(/^#\/manga\/([^/]+)$/);
   if (page) {
     R.manga = null;
